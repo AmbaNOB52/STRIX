@@ -75,8 +75,7 @@ ifeq ($(CONFIG_COMPAT_VDSO), y)
   ifeq ($(CROSS_COMPILE_COMPAT),)
     $(error CROSS_COMPILE_COMPAT not defined or empty, the compat vDSO will not be built)
   else ifeq ($(cc-name),clang)
-    export CLANG_TRIPLE_ARM32 ?= $(CROSS_COMPILE_COMPAT)
-    export CLANG_TARGET_ARM32 := --target=$(notdir $(CLANG_TRIPLE_ARM32:%-=%))
+    export CROSS_COMPILE_COMPAT
     export CONFIG_VDSO32 := y
     vdso32 := -DCONFIG_VDSO32=1
 >>>>>>> e912bd45427f (arm64: Switch to CROSS_COMPILE_COMPAT for vDSO32 compilation)
