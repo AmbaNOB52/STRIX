@@ -42,7 +42,7 @@ jobs:
           export BUILD_START=`date`
           export PATH="${PWD}/clang/bin:${PATH}"        
           export KBUILD_BUILD_USER=Building 
-          export KBUILD_BUILD_HOST=STRIX_personal
+          export KBUILD_BUILD_HOST=AmbaNOB 
           export KBUILD_COMPILER_STRING="${PWD}/clang"                  
           make O=out ARCH=arm64 sweet_defconfig     
           make -j$(nproc --all) O=out LLVM=1 LLVM_IAS=1 \
