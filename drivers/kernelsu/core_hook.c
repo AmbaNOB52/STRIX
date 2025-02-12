@@ -49,7 +49,8 @@
 #include "throne_tracker.h"
 #include "kernel_compat.h"
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) || defined(KSU_COMPAT_GET_CRED_RCU)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) ||	\
+	defined(KSU_COMPAT_GET_CRED_RCU)
 #define KSU_GET_CRED_RCU
 #endif
 
@@ -65,8 +66,9 @@ bool susfs_is_allow_su(void)
 
 extern u32 susfs_zygote_sid;
 extern bool susfs_is_mnt_devname_ksu(struct path *path);
+#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
 extern bool susfs_is_log_enabled __read_mostly;
-
+#endif
 #ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
 extern void susfs_run_try_umount_for_current_mnt_ns(void);
 #endif // #ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
@@ -203,11 +205,32 @@ static void disable_seccomp(void)
 #endif
 }
 
+/* 
+ * If kernel devs not backport this, we'll enable this function
+ * (Must put this on kernel_compat.c, but anyway)
+ */
+#ifndef KSU_GET_CRED_RCU
+static inline const struct cred *get_cred_rcu(const struct cred *cred)
+{
+	struct cred *nonconst_cred = (struct cred *) cred;
+	if (!cred)
+		return NULL;
+#ifdef KSU_COMPAT_ATOMIC_LONG
+	if (!atomic_long_inc_not_zero(&nonconst_cred->usage))
+#else
+	if (!atomic_inc_not_zero(&nonconst_cred->usage))
+#endif		
+		return NULL;
+	validate_creds(cred);
+	nonconst_cred->non_rcu = 0;
+	return cred;
+}
+#endif
+
 void ksu_escape_to_root(void)
 {
 	struct cred *cred;
 
-#ifdef KSU_GET_CRED_RCU
 	rcu_read_lock();
 
 	do {
@@ -220,14 +243,6 @@ void ksu_escape_to_root(void)
 		rcu_read_unlock();
 		return;
 	}
-#else
-	cred = (struct cred *)__task_cred(current);
-
-	if (cred->euid.val == 0) {
-		pr_warn("Already root, don't escape!\n");
-		return;
-	}
-#endif
 
 	struct root_profile *profile = ksu_get_root_profile(cred->uid.val);
 
@@ -256,16 +271,10 @@ void ksu_escape_to_root(void)
 	       sizeof(cred->cap_permitted));
 	memcpy(&cred->cap_bset, &profile->capabilities.effective,
 	       sizeof(cred->cap_bset));
-	// set ambient caps to all-zero
-	// fixes "operation not permitted" on dbus cap dropping
-	memset(&cred->cap_ambient, 0,
-			sizeof(cred->cap_ambient));
 
 	setup_groups(profile, cred);
 	
-#ifdef KSU_GET_CRED_RCU
 	rcu_read_unlock();
-#endif
 
 	// Refer to kernel/seccomp.c: seccomp_set_mode_strict
 	// When disabling Seccomp, ensure that current->sighand->siglock is held during the operation.
@@ -895,14 +904,13 @@ static bool should_umount(struct path *path)
 #endif
 }
 
-static int ksu_umount_mnt(struct path *path, int flags)
+static void ksu_umount_mnt(struct path *path, int flags)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0) || defined(KSU_UMOUNT)
-	return path_umount(path, flags);
-#else
-	// TODO: umount for non GKI kernel
-	return -ENOSYS;
-#endif
+	int err = path_umount(path, flags);
+	if (err) {
+		pr_info("umount %s failed, ret: %d\n",
+			path->dentry->d_iname, err);
+	}
 }
 
 #ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
@@ -927,16 +935,13 @@ static void ksu_try_umount(const char *mnt, bool check_mnt, int flags)
 		return;
 	}
 
-#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
+#if defined(CONFIG_KSU_SUSFS_TRY_UMOUNT) && defined(CONFIG_KSU_SUSFS_ENABLE_LOG)
 	if (susfs_is_log_enabled) {
 		pr_info("susfs: umounting '%s' for uid: %d\n", mnt, uid);
 	}
 #endif
 
-	err = ksu_umount_mnt(&path, flags);
-	if (err) {
-		pr_warn("umount %s failed: %d\n", mnt, err);
-	}
+	ksu_umount_mnt(&path, flags);
 }
 
 #ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT
@@ -1016,10 +1021,11 @@ out_ksu_try_umount:
 		pr_info("uid: %d should not umount!\n", current_uid().val);
 #endif
 	}
+
 #ifndef CONFIG_KSU_SUSFS_SUS_MOUNT
- 	// check old process's selinux context, if it is not zygote, ignore it!
- 	// because some su apps may setuid to untrusted_app but they are in global mount namespace
- 	// when we umount for such process, that is a disaster!
+	// check old process's selinux context, if it is not zygote, ignore it!
+	// because some su apps may setuid to untrusted_app but they are in global mount namespace
+	// when we umount for such process, that is a disaster!
 	bool is_zygote_child = ksu_is_zygote(old->security);
 #endif
 	if (!is_zygote_child) {
@@ -1037,51 +1043,25 @@ out_ksu_try_umount:
 	// susfs come first, and lastly umount by ksu, make sure umount in reversed order
 	susfs_try_umount_all(new_uid.val);
 #else
-
 	// fixme: use `collect_mounts` and `iterate_mount` to iterate all mountpoint and
 	// filter the mountpoint whose target is `/data/adb`
 	ksu_try_umount("/system", true, 0);
-	ksu_try_umount("/system_ext", true, 0);
 	ksu_try_umount("/vendor", true, 0);
 	ksu_try_umount("/product", true, 0);
+	ksu_try_umount("/system_ext", true, 0);
+	
+	// try umount modules path
 	ksu_try_umount("/data/adb/modules", false, MNT_DETACH);
 
 	// try umount ksu temp path
 	ksu_try_umount("/debug_ramdisk", false, MNT_DETACH);
 	ksu_try_umount("/sbin", false, MNT_DETACH);
-	
-	// try umount hosts file
-	ksu_try_umount("/system/etc/hosts", false, MNT_DETACH);
 #endif
+
 	return 0;
 }
 
-// Init functons
-
-static int handler_pre(struct kprobe *p, struct pt_regs *regs)
-{
-	struct pt_regs *real_regs = PT_REAL_REGS(regs);
-	int option = (int)PT_REGS_PARM1(real_regs);
-	unsigned long arg2 = (unsigned long)PT_REGS_PARM2(real_regs);
-	unsigned long arg3 = (unsigned long)PT_REGS_PARM3(real_regs);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
-	// PRCTL_SYMBOL is the arch-specificed one, which receive raw pt_regs from syscall
-	unsigned long arg4 = (unsigned long)PT_REGS_SYSCALL_PARM4(real_regs);
-#else
-	// PRCTL_SYMBOL is the common one, called by C convention in do_syscall_64
-	// https://elixir.bootlin.com/linux/v4.15.18/source/arch/x86/entry/common.c#L287
-	unsigned long arg4 = (unsigned long)PT_REGS_CCALL_PARM4(real_regs);
-#endif
-	unsigned long arg5 = (unsigned long)PT_REGS_PARM5(real_regs);
-
-	return ksu_handle_prctl(option, arg2, arg3, arg4, arg5);
-}
-
-static struct kprobe prctl_kp = {
-	.symbol_name = PRCTL_SYMBOL,
-	.pre_handler = handler_pre,
-};
-
+#ifdef MODULE
 static int renameat_handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
@@ -1101,29 +1081,7 @@ static struct kprobe renameat_kp = {
 	.symbol_name = "vfs_rename",
 	.pre_handler = renameat_handler_pre,
 };
-
-__maybe_unused int ksu_kprobe_init(void)
-{
-	int rc = 0;
-	rc = register_kprobe(&prctl_kp);
-
-	if (rc) {
-		pr_info("prctl kprobe failed: %d.\n", rc);
-		return rc;
-	}
-
-	rc = register_kprobe(&renameat_kp);
-	pr_info("renameat kp: %d\n", rc);
-
-	return rc;
-}
-
-__maybe_unused int ksu_kprobe_exit(void)
-{
-	unregister_kprobe(&prctl_kp);
-	unregister_kprobe(&renameat_kp);
-	return 0;
-}
+#endif /* MODULE */
 
 static int ksu_task_prctl(int option, unsigned long arg2, unsigned long arg3,
 			  unsigned long arg4, unsigned long arg5)
@@ -1132,7 +1090,9 @@ static int ksu_task_prctl(int option, unsigned long arg2, unsigned long arg3,
 	return -ENOSYS;
 }
 // kernel 4.4 and 4.9
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) || defined(CONFIG_IS_HW_HISI) || defined(CONFIG_KSU_ALLOWLIST_WORKAROUND)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) ||	\
+	defined(CONFIG_IS_HW_HISI) ||	\
+	defined(CONFIG_KSU_ALLOWLIST_WORKAROUND)
 static int ksu_key_permission(key_ref_t key_ref, const struct cred *cred,
 			      unsigned perm)
 {
@@ -1165,7 +1125,9 @@ static struct security_hook_list ksu_hooks[] = {
 	LSM_HOOK_INIT(task_prctl, ksu_task_prctl),
 	LSM_HOOK_INIT(inode_rename, ksu_inode_rename),
 	LSM_HOOK_INIT(task_fix_setuid, ksu_task_fix_setuid),
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) || defined(CONFIG_IS_HW_HISI) || defined(CONFIG_KSU_ALLOWLIST_WORKAROUND)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) ||	\
+	defined(CONFIG_IS_HW_HISI) ||	\
+	defined(CONFIG_KSU_ALLOWLIST_WORKAROUND)
 	LSM_HOOK_INIT(key_permission, ksu_key_permission)
 #endif
 };
@@ -1355,9 +1317,4 @@ void __init ksu_core_init(void)
 
 void ksu_core_exit(void)
 {
-#ifdef CONFIG_KPROBES
-	pr_info("ksu_core_kprobe_exit\n");
-	// we dont use this now
-	// ksu_kprobe_exit();
-#endif
 }
