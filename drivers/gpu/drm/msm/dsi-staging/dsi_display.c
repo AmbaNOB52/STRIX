@@ -7117,8 +7117,6 @@ int dsi_display_set_mode(struct dsi_display *display,
 		goto error;
 	}
     
-    if (adj_mode.timing.refresh_rate == 120)
-			dsi_display_panel_gamma_mode_change(display, &adj_mode);
     if (adj_mode.timing.refresh_rate == 90)
 		dsi_display_panel_gamma_mode_change(display, &adj_mode);
 	if (adj_mode.timing.refresh_rate == 60)
